@@ -5,12 +5,23 @@ ignore_eos, numbered-word instruction. Reports median per-stream decode tok/s
 after first token (their cell value) + acceptance-ish stats from server logs are
 read separately.  Usage: bench_miaai.py --base-url ... --prompt 256 --concurrency 1
 """
-import argparse, asyncio, json, statistics, time, urllib.error, urllib.request
+import argparse, asyncio, json, os, statistics, time, urllib.error, urllib.request
 
-def request_json(url, body):
+def _api_key(args=None):
+    """Resolve the API key: --api-key arg, else VLLM_API_KEY env, else ''. """
+    key = ""
+    if args is not None:
+        key = getattr(args, "api_key", "") or ""
+    if not key:
+        key = os.environ.get("VLLM_API_KEY", "")
+    return key
+
+def request_json(url, body, api_key=""):
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     for attempt in range(4):
-        req = urllib.request.Request(url, data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=3600) as resp:
                 return json.load(resp)
@@ -22,16 +33,16 @@ def request_json(url, body):
 def tokenize_url(base_url):
     return base_url.removesuffix("/v1") + "/tokenize"
 
-def build_prompt(base_url, model, target, nonce):
+def build_prompt(base_url, model, target, nonce, api_key=""):
     unit = "benchmark context datum "
     text = f"unique request {nonce} " + unit * max(1, target // 3)
     while True:
-        count = request_json(tokenize_url(base_url), {"model": model, "prompt": text})["count"]
+        count = request_json(tokenize_url(base_url), {"model": model, "prompt": text}, api_key)["count"]
         if count >= target:
             return text
         text += unit * max(1, (target - count) // 3)
 
-def stream_one(base_url, model, prompt):
+def stream_one(base_url, model, prompt, api_key=""):
     instruction = "\nReturn exactly 128 numbered lowercase English words, then stop."
     body = {
         "model": model,
@@ -41,8 +52,11 @@ def stream_one(base_url, model, prompt):
         "max_tokens": 128, "min_tokens": 128, "ignore_eos": True,
         "chat_template_kwargs": {"thinking": False},
     }
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     req = urllib.request.Request(f"{base_url}/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=headers)
     started = time.perf_counter()
     first = None
     usage = None
@@ -68,14 +82,14 @@ def stream_one(base_url, model, prompt):
             "output_tok_s": output_tokens / max(0.001, finished - (first or finished)),
             "prompt_tokens": (usage or {}).get("prompt_tokens", 0)}
 
-async def run_case(base_url, model, target_prompt_tokens, concurrency, nonce_base):
+async def run_case(base_url, model, target_prompt_tokens, concurrency, nonce_base, api_key=""):
     prompts = await asyncio.gather(*[
         asyncio.to_thread(build_prompt, base_url, model, target_prompt_tokens,
-                          f"p{target_prompt_tokens}-c{concurrency}-{nonce_base}-r{index}")
+                          f"p{target_prompt_tokens}-c{concurrency}-{nonce_base}-r{index}", api_key)
         for index in range(concurrency)
     ])
     started = time.perf_counter()
-    results = await asyncio.gather(*[asyncio.to_thread(stream_one, base_url, model, p) for p in prompts])
+    results = await asyncio.gather(*[asyncio.to_thread(stream_one, base_url, model, p, api_key) for p in prompts])
     elapsed = time.perf_counter() - started
     total = sum(r["output_tokens"] for r in results)
     return {"concurrency": concurrency, "elapsed_s": elapsed,
@@ -91,10 +105,12 @@ async def main():
     ap.add_argument("--prompt", type=int, default=256)
     ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--repeat", type=int, default=5, help="how many sequential trials (unique nonces)")
+    ap.add_argument("--api-key", default="", help="Bearer API key (default: $VLLM_API_KEY)")
     args = ap.parse_args()
+    api_key = _api_key(args)
     rows = []
     for rep in range(args.repeat):
-        case = await run_case(args.base_url, args.model, args.prompt, args.concurrency, rep)
+        case = await run_case(args.base_url, args.model, args.prompt, args.concurrency, rep, api_key)
         rows.append(case)
         med = case["median_output_tok_s"]
         print(f"trial {rep}: c={case['concurrency']} p={args.prompt} "

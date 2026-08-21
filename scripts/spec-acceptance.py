@@ -18,6 +18,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -28,9 +29,21 @@ import urllib.request
 POSITION_RE = re.compile(r'position="(\d+)"')
 
 
-def get_metrics(base_url: str) -> dict:
+def _api_key(args=None):
+    """Resolve the API key: --api-key arg, else VLLM_API_KEY env, else ''. """
+    key = ""
+    if args is not None:
+        key = getattr(args, "api_key", "") or ""
+    if not key:
+        key = os.environ.get("VLLM_API_KEY", "")
+    return key
+
+
+def get_metrics(base_url: str, api_key: str = "") -> dict:
     url = base_url.removesuffix("/v1") + "/metrics"
-    with urllib.request.urlopen(url, timeout=30) as r:
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=30) as r:
         txt = r.read().decode()
     out = {"drafted": None, "accepted": None, "drafts": None, "per_pos": {}}
     for line in txt.splitlines():
@@ -60,9 +73,11 @@ def main() -> int:
     ap.add_argument("--prompt", type=int, default=256)
     ap.add_argument("--bench-script", default="scripts/bench-miaai.py",
                     help="MiaAI-methodology bench that moves the counters")
+    ap.add_argument("--api-key", default="", help="Bearer API key (default: $VLLM_API_KEY)")
     args = ap.parse_args()
+    api_key = _api_key(args)
 
-    m1 = get_metrics(args.base_url)
+    m1 = get_metrics(args.base_url, api_key)
     if m1["drafted"] is None or m1["accepted"] is None:
         print("NO draft counters in /metrics — is spec-decode on? (check MTP_NUM_TOKENS)")
         return 0
@@ -71,9 +86,11 @@ def main() -> int:
     cmd = [sys.executable, args.bench_script, "--base-url", args.base_url,
            "--model", args.model, "--prompt", str(args.prompt),
            "--concurrency", "1", "--repeat", str(args.trials)]
+    if api_key:
+        cmd += ["--api-key", api_key]
     subprocess.run(cmd, capture_output=True)
 
-    m2 = get_metrics(args.base_url)
+    m2 = get_metrics(args.base_url, api_key)
     if m2["drafted"] is None or m2["accepted"] is None:
         print("NO draft counters in /metrics — is spec-decode on? (check MTP_NUM_TOKENS)")
         return 0
