@@ -154,6 +154,9 @@ if (( 10#$VLLM_PORT < 1 || 10#$VLLM_PORT > 65535 )); then
   exit 2
 fi
 VLLM_PORT="$((10#$VLLM_PORT))"
+
+source "$SCRIPT_DIR/dspark-numeric-knobs.sh"
+dspark_validate_numeric_knobs "$_dspark_env_clean" || exit $?
 # Keep PORT as a backwards-compatible alias, but use VLLM_PORT internally.
 PORT="$VLLM_PORT"
 DEFAULT_THINKING="${DEFAULT_THINKING:-low}"
@@ -788,6 +791,7 @@ print_resolved_profile() {
   echo "  mtp speculative tokens: ${MTP_NUM_TOKENS:-5} (dspark_block_size min is 5)"
   echo "  default thinking: $DEFAULT_THINKING (off/low/high/max)"
   echo "  issue31 GPU thinking_token_budget hotfix: ${DSPARK_ENABLE_ISSUE31_GPU_HOTFIX:-0} (0=stock V2 / 1=apply)"
+  echo "  issue133 Triton specialization hotfix: will apply on start"
   echo "  cudagraph capture size: $(( ${MAX_NUM_SEQS:-6} * (${MTP_NUM_TOKENS:-5} + 1) ))"
   echo "  API bind: $VLLM_HOST:$VLLM_PORT"
   echo "  API probe: $API_URL"
@@ -817,9 +821,9 @@ print_resolved_profile() {
     echo "  Issue #22 hotfix: not found"
   fi
   if [ "${DSPARK_SKIP_HOTFIX:-0}" = "1" ]; then
-    echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298/#44993-grammar): SKIPPED (DSPARK_SKIP_HOTFIX=1)"
+    echo "  DSV4 perf hotfixes (#50312/#49486+52492/#48407/#48957/#50298/#44993-grammar): SKIPPED (DSPARK_SKIP_HOTFIX=1)"
   else
-    echo "  DSV4 perf hotfixes (#50312/#50004/#49486/#48407/#48957/#50298/#44993-grammar): will apply on start"
+    echo "  DSV4 perf hotfixes (#50312/#49486+52492/#48407/#48957/#50298/#44993-grammar): will apply on start"
   fi
   if [ "${DSPARK_SKIP_SPIN_WAIT_HOTFIX:-0}" = "1" ]; then
     echo "  GB10 shm spin-wait hotfix (#79): SKIPPED (DSPARK_SKIP_SPIN_WAIT_HOTFIX=1)"
@@ -952,7 +956,7 @@ if [ -f "$DSPARK_SPIN_WAIT_HOTFIX" ]; then
   scp "$DSPARK_SPIN_WAIT_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-gb10-spin-wait.sh"
 fi
 # DSV4 v0.27 .sh hotfixes — entrypoint applies them before exec vllm (issue #38).
-for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-adaptive-topk-50004.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh hotfix-vllm-redact-api-key-log.sh; do
+for _hf_sync in hotfix-dsv4-mtp-buffer-50312.sh hotfix-dsv4-skip-topk-49486.sh hotfix-dsv4-dense-prefill-indexer-48407.sh hotfix-dsv4-skip-empty-c128-48957.sh hotfix-dsv4-flashmla-workspace-50298.sh hotfix-dsv4-grammar-advance.sh hotfix-vllm-redact-api-key-log.sh; do
   if [ -f "$SCRIPT_DIR/patches/$_hf_sync" ]; then
     echo "Syncing $_hf_sync to ${WORKER_HOST}:${WORKER_DIR}/patches/"
     ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
@@ -1000,6 +1004,12 @@ if [ -f "$DSPARK_ISSUE26_HOTFIX" ]; then
   echo "Syncing Issue #26 hybrid-SWA-min hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
   ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
   scp "$DSPARK_ISSUE26_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue26-hybrid-swa-min.py"
+fi
+DSPARK_ISSUE133_HOTFIX="${DSPARK_ISSUE133_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-issue133-triton-specialization.py}"
+if [ -f "$DSPARK_ISSUE133_HOTFIX" ]; then
+  echo "Syncing Issue #133 Triton specialization hotfix to ${WORKER_HOST}:${WORKER_DIR}/patches/"
+  ssh "$WORKER_HOST" "mkdir -p '${REMOTE_WORKER_DIR}/patches'"
+  scp "$DSPARK_ISSUE133_HOTFIX" "${WORKER_HOST}:${REMOTE_WORKER_DIR}/patches/hotfix-dsv4-issue133-triton-specialization.py"
 fi
 DSPARK_SUPPRESS_STOPS_HOTFIX="${DSPARK_SUPPRESS_STOPS_HOTFIX:-$SCRIPT_DIR/patches/hotfix-dsv4-suppress-stops-in-reasoning.py}"
 if [ -f "$DSPARK_SUPPRESS_STOPS_HOTFIX" ]; then
@@ -1107,6 +1117,41 @@ for _ in $(seq 1 "$WAIT_ATTEMPTS"); do
         -H "Content-Type: application/json" \
         -d '{"model":"'"${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}"'","messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":32,"temperature":0.6,"top_p":0.95,"chat_template_kwargs":{"thinking":true,"reasoning_effort":"low"}}' >/dev/null
       echo "Minimal chat request succeeded."
+    fi
+    # Issue #117: burn the spec-decode/prefill Triton shape buckets before real
+    # traffic can JIT them mid-serve (a compiling rank can stall its peer past
+    # torch's 600 s NCCL watchdog). Non-fatal: warmup gaps degrade back to the
+    # mid-serve-JIT status quo, never to a failed boot.
+    if [ "${DSPARK_BOOT_SHAPE_WARMUP:-1}" = "1" ]; then
+      # Authenticated clusters need a valid bearer or every sweep request 401s
+      # and warms nothing. Hand the child the same credential this script's
+      # smoke probe uses: the first already-parsed DSPARK_API_KEYS key, else
+      # VLLM_API_KEY (they are mutually exclusive upstream). The launcher-to-
+      # warmup handoff uses the environment, not a script argument or log line.
+      _warmup_bearer="${VLLM_API_KEY:-}"
+      if [ "$_dspark_keys_set" = "1" ]; then
+        _warmup_bearer="${_dspark_keys[0]}"
+      fi
+      # Sampler-cache postcondition (see the sweep script): hand the child the
+      # HOST path of this node's persistent Triton cache. Only the compose
+      # default layout (container path under /cache/huggingface, backed by the
+      # HF_CACHE bind mount) is mappable from here; any custom TRITON_CACHE_DIR
+      # gets an empty path and the sweep skips that check with a note.
+      _warmup_tcache_container="${TRITON_CACHE_DIR:-/cache/huggingface/triton-cache}"
+      _warmup_tcache_host=""
+      case "$_warmup_tcache_container" in
+        /cache/huggingface/*)
+          _warmup_tcache_host="${HF_CACHE:-${HOME}/.cache/huggingface}${_warmup_tcache_container#/cache/huggingface}"
+          ;;
+      esac
+      DSPARK_WARMUP_MAX_CONCURRENCY="${MAX_NUM_SEQS:-6}" \
+        DSPARK_WARMUP_BEARER="$_warmup_bearer" \
+        DSPARK_WARMUP_TRITON_CACHE_DIR="$_warmup_tcache_host" \
+        bash "$SCRIPT_DIR/scripts/boot-shape-warmup.sh" \
+        "${CHAT_URL%/v1/chat/completions}" "${SERVED_MODEL_NAME:-deepseek-v4-flash-dspark}" || \
+        echo "WARN: boot shape warmup incomplete — uncovered shapes may JIT mid-serve (issue #117)" >&2
+    else
+      echo "Boot shape warmup: SKIPPED (DSPARK_BOOT_SHAPE_WARMUP=0)"
     fi
     exit 0
   fi
