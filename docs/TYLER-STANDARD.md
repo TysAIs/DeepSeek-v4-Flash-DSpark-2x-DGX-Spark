@@ -16,8 +16,8 @@ Upstream merges land weekly. When syncing:
 2. Resolve conflicts: take THEIRS everywhere EXCEPT `results/*` (our redacted benches — always OURS)
 3. Privacy scan the merged tree (private IPs / sk- keys / GOCSPX-) before commit — public repo
 4. Validate: `bash scripts/ci-validate.sh` (run on a Spark; macOS bash lacks mapfile) — must pass
-5. Push to fork; then re-sync `.env.dspark` + compose onto allspark if recipe env changed,
+5. Push to fork; then re-sync `.env.dspark` + compose onto node1 if recipe env changed,
    and re-run the validate-dspark-config.sh drift gate
 
-## Known post-aragorn topology (08-25)
-TP2 = allspark (rank0, publishes :8888) + arbiter (rank1 worker). aragorn SOLD.
+## Known topology (08-25)
+TP2 = node1 (rank0, publishes :8888) + node2 (rank1 worker). The third node was sold.
